@@ -1,0 +1,176 @@
+-- Power BI measure pack for the Starlink Support Workforce Command Center.
+-- Assumed main table name: 'Support Intervals'
+-- Recommended supporting tables: 'Scenario Assumptions', 'Staff Plan'
+
+Total Requests =
+SUM ( 'Support Intervals'[Requests] )
+
+Resolved Requests =
+SUM ( 'Support Intervals'[Resolved] )
+
+Abandoned Requests =
+SUM ( 'Support Intervals'[Abandoned] )
+
+Expired Or Declined Requests =
+SUM ( 'Support Intervals'[ExpiredDeclined] )
+
+Abandon Rate =
+DIVIDE ( [Abandoned Requests], [Total Requests] )
+
+Total Handle Seconds =
+SUM ( 'Support Intervals'[TotalHandleSeconds] )
+
+AHT Seconds =
+DIVIDE ( [Total Handle Seconds], [Resolved Requests] )
+
+AHT Minutes =
+DIVIDE ( [AHT Seconds], 60 )
+
+AWT Seconds =
+DIVIDE (
+    SUMX (
+        'Support Intervals',
+        'Support Intervals'[AWTSeconds] * 'Support Intervals'[Requests]
+    ),
+    [Total Requests]
+)
+
+Service Level =
+DIVIDE (
+    SUMX (
+        'Support Intervals',
+        'Support Intervals'[SLPercent] * 'Support Intervals'[Requests]
+    ),
+    [Total Requests]
+)
+
+Target Service Level =
+SELECTEDVALUE ( 'Scenario Assumptions'[TargetServiceLevel], 0.80 )
+
+Answer Threshold Seconds =
+SELECTEDVALUE ( 'Scenario Assumptions'[AnswerThresholdSeconds], 20 )
+
+Shrinkage Percent =
+SELECTEDVALUE ( 'Scenario Assumptions'[ShrinkagePercent], 0.30 )
+
+Occupancy Cap =
+SELECTEDVALUE ( 'Scenario Assumptions'[OccupancyCap], 0.85 )
+
+Forecast Growth Percent =
+SELECTEDVALUE ( 'Scenario Assumptions'[ForecastGrowthPercent], 0 )
+
+Service Level Gap =
+[Service Level] - [Target Service Level]
+
+Met Service Level Target =
+IF ( [Service Level] >= [Target Service Level], 1, 0 )
+
+Baseline Forecast Requests =
+AVERAGEX (
+    VALUES ( 'Support Intervals'[Date] ),
+    [Total Requests]
+)
+
+Scenario Forecast Requests =
+[Baseline Forecast Requests] * ( 1 + [Forecast Growth Percent] )
+
+Workload Hours =
+DIVIDE ( [Scenario Forecast Requests] * [AHT Seconds], 3600 )
+
+Capacity Agents At Occupancy Cap =
+CEILING ( DIVIDE ( [Workload Hours], [Occupancy Cap] ), 1 )
+
+Capacity Agents With Shrinkage =
+CEILING (
+    DIVIDE ( [Capacity Agents At Occupancy Cap], 1 - [Shrinkage Percent] ),
+    1
+)
+
+-- Erlang C dynamic measure.
+-- Use this for interval-level what-if views. For enterprise-scale production,
+-- precomputing the Erlang output in Power Query, SQL, Python, or your Excel tool
+-- will usually perform better.
+Erlang Required Agents =
+VAR Calls = [Scenario Forecast Requests]
+VAR AHT = [AHT Seconds]
+VAR IntervalSeconds = 3600
+VAR TargetSL = [Target Service Level]
+VAR ThresholdSeconds = [Answer Threshold Seconds]
+VAR TrafficIntensity = DIVIDE ( Calls * AHT, IntervalSeconds )
+VAR MinAgents = MAX ( 1, CEILING ( TrafficIntensity, 1 ) )
+VAR MaxAgents = MIN ( 170, MinAgents + 80 )
+VAR Candidates =
+    GENERATESERIES ( MinAgents, MaxAgents, 1 )
+VAR CandidateResults =
+    ADDCOLUMNS (
+        Candidates,
+        "CalculatedSL",
+            VAR Agents = [Value]
+            VAR ErlangSum =
+                SUMX (
+                    GENERATESERIES ( 0, Agents - 1, 1 ),
+                    DIVIDE ( POWER ( TrafficIntensity, [Value] ), FACT ( [Value] ) )
+                )
+            VAR ErlangN =
+                DIVIDE ( POWER ( TrafficIntensity, Agents ), FACT ( Agents ) )
+                    * DIVIDE ( Agents, Agents - TrafficIntensity )
+            VAR ProbabilityWait =
+                DIVIDE ( ErlangN, ErlangSum + ErlangN )
+            VAR ServiceLevelAtAgents =
+                IF (
+                    Agents > TrafficIntensity && AHT > 0,
+                    1 - ProbabilityWait
+                        * EXP ( - ( Agents - TrafficIntensity ) * ThresholdSeconds / AHT ),
+                    0
+                )
+            RETURN
+                ServiceLevelAtAgents
+    )
+RETURN
+    IF (
+        TrafficIntensity <= 0 || MinAgents > 170,
+        BLANK (),
+        MINX ( FILTER ( CandidateResults, [CalculatedSL] >= TargetSL ), [Value] )
+    )
+
+Erlang Agents With Shrinkage =
+CEILING ( DIVIDE ( [Erlang Required Agents], 1 - [Shrinkage Percent] ), 1 )
+
+Scheduled Agents =
+SUM ( 'Staff Plan'[ScheduledAgents] )
+
+Staffing Gap =
+[Scheduled Agents] - [Erlang Agents With Shrinkage]
+
+Staffing Gap Status =
+SWITCH (
+    TRUE (),
+    ISBLANK ( [Staffing Gap] ), BLANK (),
+    [Staffing Gap] < 0, "Understaffed",
+    [Staffing Gap] = 0, "Exactly staffed",
+    "Overstaffed"
+)
+
+At Risk Interval Count =
+COUNTROWS (
+    FILTER (
+        SUMMARIZE (
+            'Support Intervals',
+            'Support Intervals'[Date],
+            'Support Intervals'[Hour24]
+        ),
+        [Service Level] < [Target Service Level]
+    )
+)
+
+Peak Interval Requests =
+MAX ( 'Support Intervals'[Requests] )
+
+Request Variability =
+STDEVX.P (
+    VALUES ( 'Support Intervals'[DateHourKey] ),
+    [Total Requests]
+)
+
+Efficiency Opportunity Seconds =
+MAX ( 0, [AWT Seconds] - [Answer Threshold Seconds] )
